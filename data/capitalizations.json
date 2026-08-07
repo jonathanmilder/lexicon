@@ -1,0 +1,235 @@
+{
+  "_README": [
+    "Capitalization corrections for the v3.1 import. Set `status` to \"accepted\" or \"rejected\" — the loader applies accepted entries and nothing else.",
+    "Correct `capitalization` by hand if a proposal is close but wrong. A re-run preserves any entry you have touched.",
+    "Evidence for every entry is in data/capitalization-review.md.",
+    "`script_proposed` records the script's own suggestion. Do not edit it — it is how a re-run tells your work from its own."
+  ],
+  "corrections": {
+    "annunciation": {
+      "capitalization": "Annunciation",
+      "status": "unreviewed",
+      "script_proposed": "Annunciation"
+    },
+    "apostle": {
+      "capitalization": "Apostle",
+      "status": "unreviewed",
+      "script_proposed": "Apostle"
+    },
+    "arcadia": {
+      "capitalization": "Arcadia",
+      "status": "unreviewed",
+      "script_proposed": "Arcadia"
+    },
+    "bight": {
+      "capitalization": "Bight",
+      "status": "unreviewed",
+      "script_proposed": "Bight"
+    },
+    "bourse": {
+      "capitalization": "Bourse",
+      "status": "unreviewed",
+      "script_proposed": "Bourse"
+    },
+    "brigadoon": {
+      "capitalization": "Brigadoon",
+      "status": "unreviewed",
+      "script_proposed": "Brigadoon"
+    },
+    "cassandra": {
+      "capitalization": "Cassandra",
+      "status": "unreviewed",
+      "script_proposed": "Cassandra"
+    },
+    "catechism": {
+      "capitalization": "Catechism",
+      "status": "unreviewed",
+      "script_proposed": "Catechism"
+    },
+    "cenotaph": {
+      "capitalization": "Cenotaph",
+      "status": "unreviewed",
+      "script_proposed": "Cenotaph"
+    },
+    "chevalier": {
+      "capitalization": "Chevalier",
+      "status": "unreviewed",
+      "script_proposed": "Chevalier"
+    },
+    "cloaca": {
+      "capitalization": "Cloaca",
+      "status": "unreviewed",
+      "script_proposed": "Cloaca"
+    },
+    "concordance": {
+      "capitalization": "Concordance",
+      "status": "unreviewed",
+      "script_proposed": "Concordance"
+    },
+    "dowager": {
+      "capitalization": "Dowager",
+      "status": "unreviewed",
+      "script_proposed": "Dowager"
+    },
+    "dreadnought": {
+      "capitalization": "Dreadnought",
+      "status": "unreviewed",
+      "script_proposed": "Dreadnought"
+    },
+    "embankment": {
+      "capitalization": "Embankment",
+      "status": "unreviewed",
+      "script_proposed": "Embankment"
+    },
+    "escarpment": {
+      "capitalization": "Escarpment",
+      "status": "unreviewed",
+      "script_proposed": "Escarpment"
+    },
+    "eventide": {
+      "capitalization": "Eventide",
+      "status": "unreviewed",
+      "script_proposed": "Eventide"
+    },
+    "fleur-de-lis": {
+      "capitalization": "Fleur-de-Lis",
+      "status": "unreviewed",
+      "script_proposed": "Fleur-de-Lis"
+    },
+    "flume": {
+      "capitalization": "Flume",
+      "status": "unreviewed",
+      "script_proposed": "Flume"
+    },
+    "gestalt": {
+      "capitalization": "Gestalt",
+      "status": "unreviewed",
+      "script_proposed": "Gestalt"
+    },
+    "goldilocks": {
+      "capitalization": "Goldilocks",
+      "status": "unreviewed",
+      "script_proposed": "Goldilocks"
+    },
+    "gordian knot": {
+      "capitalization": "Gordian knot",
+      "status": "unreviewed",
+      "script_proposed": "Gordian knot"
+    },
+    "herald": {
+      "capitalization": "Herald",
+      "status": "unreviewed",
+      "script_proposed": "Herald"
+    },
+    "kraken": {
+      "capitalization": "Kraken",
+      "status": "unreviewed",
+      "script_proposed": "Kraken"
+    },
+    "lebensraum": {
+      "capitalization": "Lebensraum",
+      "status": "unreviewed",
+      "script_proposed": "Lebensraum"
+    },
+    "maginot line": {
+      "capitalization": "Maginot Line",
+      "status": "unreviewed",
+      "script_proposed": "Maginot Line"
+    },
+    "nereid": {
+      "capitalization": "Nereid",
+      "status": "unreviewed",
+      "script_proposed": "Nereid"
+    },
+    "panglossian": {
+      "capitalization": "Panglossian",
+      "status": "unreviewed",
+      "script_proposed": "Panglossian"
+    },
+    "peripatetic": {
+      "capitalization": "Peripatetic",
+      "status": "unreviewed",
+      "script_proposed": "Peripatetic"
+    },
+    "phoenix": {
+      "capitalization": "Phoenix",
+      "status": "unreviewed",
+      "script_proposed": "Phoenix"
+    },
+    "plenipotentiary": {
+      "capitalization": "Plenipotentiary",
+      "status": "unreviewed",
+      "script_proposed": "Plenipotentiary"
+    },
+    "pollyanna": {
+      "capitalization": "Pollyanna",
+      "status": "unreviewed",
+      "script_proposed": "Pollyanna"
+    },
+    "potemkin village": {
+      "capitalization": "Potemkin village",
+      "status": "unreviewed",
+      "script_proposed": "Potemkin village"
+    },
+    "procrustean": {
+      "capitalization": "Procrustean",
+      "status": "unreviewed",
+      "script_proposed": "Procrustean"
+    },
+    "racketeer": {
+      "capitalization": "Racketeer",
+      "status": "unreviewed",
+      "script_proposed": "Racketeer"
+    },
+    "remonstrance": {
+      "capitalization": "Remonstrance",
+      "status": "unreviewed",
+      "script_proposed": "Remonstrance"
+    },
+    "rubicon": {
+      "capitalization": "Rubicon",
+      "status": "unreviewed",
+      "script_proposed": "Rubicon"
+    },
+    "rufous": {
+      "capitalization": "Rufous",
+      "status": "unreviewed",
+      "script_proposed": "Rufous"
+    },
+    "saturnalia": {
+      "capitalization": "Saturnalia",
+      "status": "unreviewed",
+      "script_proposed": "Saturnalia"
+    },
+    "serene": {
+      "capitalization": "Serene",
+      "status": "unreviewed",
+      "script_proposed": "Serene"
+    },
+    "sphinx": {
+      "capitalization": "Sphinx",
+      "status": "unreviewed",
+      "script_proposed": "Sphinx"
+    },
+    "squire": {
+      "capitalization": "Squire",
+      "status": "unreviewed",
+      "script_proposed": "Squire"
+    },
+    "stockholm syndrome": {
+      "capitalization": "Stockholm syndrome",
+      "status": "unreviewed",
+      "script_proposed": "Stockholm syndrome"
+    },
+    "svengali": {
+      "capitalization": "Svengali",
+      "status": "unreviewed",
+      "script_proposed": "Svengali"
+    },
+    "sylvan": {
+      "capitalization": "Sylvan",
+      "status": "unreviewed",
+      "script_proposed": "Sylvan"
+    }
+  }
+}
