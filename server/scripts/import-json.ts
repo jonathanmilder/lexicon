@@ -104,6 +104,82 @@ const STRUCTURE = {
  */
 const HEADWORD_SEPARATOR = /[ \-‐‑–—]/;
 
+/** The three top-level keys of the export: `{ words, progress, sources }`. */
+const TOP_LEVEL_KEYS = new Set(['words', 'progress', 'sources']);
+
+/** The eight word keys that become columns on `words`. Everything else is stray. */
+const MAPPED_KEYS = new Set([
+  'word',
+  'part_of_speech',
+  'pronunciation',
+  'definitions',
+  'etymology',
+  'usage_note',
+  'examples',
+  'mnemonics',
+]);
+
+/** The three keys of a progress record: `{ ease, repetition, nextReview }`. */
+const PROGRESS_KEYS = new Set(['ease', 'repetition', 'nextReview']);
+
+/** SM-2's ease floor. Below this is not impossible, only worth a second look. */
+const EASE_FLOOR = 1.3;
+
+/**
+ * The five stray keys Q27 resolved. None of them becomes a column, and each has
+ * a rule that step 6 will apply. Step 5 only counts them and names the words.
+ *
+ * These five are RECOGNISED, so they are report lines rather than warnings. A
+ * sixth key would be genuinely unrecognised, and that is the warning 5e means.
+ *
+ * The distinction is load-bearing: `--strict` is ON at cutover, so making the
+ * five permanent warnings would make `--strict` fail every run by construction,
+ * which would make the flag worthless on the one day it exists for.
+ */
+const STRAY_KEYS: ReadonlyArray<{
+  readonly key: string;
+  readonly expected: number;
+  readonly disposition: readonly string[];
+}> = [
+  {
+    key: 'example',
+    expected: 76,
+    disposition: [
+      'Fallback, not merge: where `examples` exists it wins outright.',
+      'Merging would need to decide whether two sentences are the same sentence,',
+      'and that is exact string matching — a curly apostrophe apart and a near',
+      'duplicate slips into a tool built for orthographic precision.',
+    ],
+  },
+  {
+    key: 'confusables',
+    expected: 3,
+    disposition: [
+      'Discarded, reported by word. A bare list of near-miss words with no',
+      'explanation; `usage_note` is already told to carry that job.',
+    ],
+  },
+  {
+    key: 'etymology_note',
+    expected: 3,
+    disposition: ['Appended to `etymology`, separated by a blank line.'],
+  },
+  {
+    key: 'pronunciation_note',
+    expected: 1,
+    disposition: ['Appended to `pronunciation`, separated by a blank line.'],
+  },
+  {
+    key: 'definitons',
+    expected: 1,
+    disposition: [
+      'A typo for `definitions`. Discarded, reported by word AND by key name —',
+      'a silent discard means a recurrence vanishes without trace.',
+      'Note it holds an array, not a string, exactly as `definitions` would.',
+    ],
+  },
+];
+
 // ---------------------------------------------------------------------------
 // Shapes. Everything off the disk is `unknown` until it has been checked —
 // JSON.parse promises nothing, and the whole job of this script is to stop
@@ -124,6 +200,8 @@ interface Backup {
   readonly words: readonly WordRecord[];
   readonly progress: Readonly<Record<string, ProgressRecord>>;
   readonly sources: Readonly<Record<string, unknown>>;
+  /** Kept so a fourth top-level key can be noticed rather than ignored. */
+  readonly topLevelKeys: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +229,11 @@ class Findings {
 // ---------------------------------------------------------------------------
 
 const n = (value: number): string => value.toLocaleString('en-US');
+
+/** `1 word` / `2 words`. Same helper migrate.ts uses, for the same reason. */
+function count(value: number, noun: string, plural = `${noun}s`): string {
+  return `${n(value)} ${value === 1 ? noun : plural}`;
+}
 
 /** One line of the counts table: label, found, expected, verdict. */
 function countLine(label: string, found: number, expected: number): string {
@@ -215,7 +298,12 @@ function readBackup(sourcePath: string): { backup: Backup; bytes: number } {
       : {};
 
   return {
-    backup: { words: root['words'] as WordRecord[], progress, sources },
+    backup: {
+      words: root['words'] as WordRecord[],
+      progress,
+      sources,
+      topLevelKeys: Object.keys(root),
+    },
     bytes,
   };
 }
@@ -363,7 +451,8 @@ function reportStructure(backup: Backup, findings: Findings): void {
     findings,
     capitalized.length === 0,
     `all ${n(words.length)} headwords are lowercase, zero exceptions.`,
-    `${n(capitalized.length)} headwords are not lowercase: ${capitalized.slice(0, 5).join(', ')}. ` +
+    `${count(capitalized.length, 'headword')} ${capitalized.length === 1 ? 'is' : 'are'} not ` +
+      `lowercase: ${capitalized.slice(0, 5).join(', ')}. ` +
       '26a assumes it supplies every capital that will ever exist in the library.',
   );
 
@@ -372,7 +461,7 @@ function reportStructure(backup: Backup, findings: Findings): void {
     findings,
     distinct.size === words.length,
     `all ${n(words.length)} headwords are distinct, compared case-insensitively.`,
-    `${n(words.length - distinct.size)} headwords collide case-insensitively. The unique ` +
+    `${count(words.length - distinct.size, 'headword')} collide case-insensitively. The unique ` +
       'index words_user_word_lower (24h) would reject them at step 6.',
   );
 
@@ -404,14 +493,15 @@ function reportStructure(backup: Backup, findings: Findings): void {
     findings,
     orphans.length === 0,
     `all ${n(progressKeys.length)} progress records resolve to a headword.`,
-    `${n(orphans.length)} progress records point at no word: ${orphans.slice(0, 5).join(', ')}.`,
+    `${count(orphans.length, 'progress record')} point at no word: ` +
+      `${orphans.slice(0, 5).join(', ')}.`,
   );
 
   claim(
     findings,
     atUnfetched.length === 0,
     'no progress record points at an unfetched word.',
-    `${n(atUnfetched.length)} progress records point at unfetched words: ` +
+    `${count(atUnfetched.length, 'progress record')} point at unfetched words: ` +
       `${atUnfetched.slice(0, 5).join(', ')}.`,
   );
 
@@ -423,6 +513,179 @@ function reportStructure(backup: Backup, findings: Findings): void {
           'match changes nothing today. Step 9 needs it anyway, once 26a adds capitals.'
       : `        ${n(exact)} match exactly; ${n(inexact)} need the case-insensitive match.`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Stray keys (5e, Q27)
+// ---------------------------------------------------------------------------
+
+/** The headwords carrying a given key, for the named report lines Q27 requires. */
+function wordsWith(backup: Backup, key: string): string[] {
+  return backup.words
+    .filter((word) => word[key] !== undefined)
+    .map((word) => String(word['word']));
+}
+
+/** `x, y and z` — the report names words, and it should read like prose. */
+function series(items: readonly string[], limit = 8): string {
+  const shown = items.slice(0, limit);
+  const tail = items.length > limit ? `, and ${n(items.length - limit)} more` : '';
+  if (shown.length <= 1) return (shown[0] ?? '') + tail;
+  return `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]}${tail}`;
+}
+
+function reportStrayKeys(backup: Backup, findings: Findings): void {
+  console.log('\nStray keys — present in the file, no column in the schema (Q27)');
+  console.log(`  ${''.padEnd(24)}${'found'.padStart(7)}${'expected'.padStart(12)}`);
+
+  for (const { key, expected, disposition } of STRAY_KEYS) {
+    const carriers = wordsWith(backup, key);
+    console.log(countLine(key, carriers.length, expected));
+
+    for (const line of disposition) console.log(`        ${line}`);
+
+    if (key === 'example') {
+      // Q27 requires both outcomes of the fallback in the summary. Counting them
+      // is detection; nothing is transformed here.
+      const alsoPlural = carriers.filter((word) =>
+        backup.words.some((w) => w['word'] === word && Array.isArray(w['examples'])),
+      );
+      const only = carriers.filter((word) => !alsoPlural.includes(word));
+      console.log(
+        `        ${n(alsoPlural.length)} also have \`examples\` — those sentences are ` +
+          'discarded at step 6.',
+      );
+      console.log(
+        `        ${n(only.length)} have \`example\` alone — promoted to sole entry: ` +
+          `${series(only)}.`,
+      );
+    } else {
+      console.log(`        On: ${series(carriers)}.`);
+    }
+
+    if (carriers.length !== expected) {
+      findings.fail(
+        `Stray key \`${key}\` appears on ${n(carriers.length)} words, not the frozen ` +
+          `${n(expected)}. Q27's rule for it was decided against that count.`,
+      );
+    }
+  }
+
+  // --- the sixth key -------------------------------------------------------
+  // This is what 5e's "unrecognised keys are warnings, never silent" is about.
+  const known = new Set([...MAPPED_KEYS, ...STRAY_KEYS.map((stray) => stray.key)]);
+  const unrecognised = new Map<string, string[]>();
+
+  for (const word of backup.words) {
+    for (const key of Object.keys(word)) {
+      if (known.has(key)) continue;
+      const carriers = unrecognised.get(key) ?? [];
+      carriers.push(String(word['word']));
+      unrecognised.set(key, carriers);
+    }
+  }
+
+  if (unrecognised.size === 0) {
+    console.log('\n  No sixth stray key. Every key in the file is either a column or one of the five.');
+  } else {
+    for (const [key, carriers] of [...unrecognised].sort()) {
+      findings.warn(
+        `Unrecognised key \`${key}\` on ${count(carriers.length, 'word')}: ${series(carriers)}. ` +
+          'Nothing in Q27 says what to do with it, so step 6 would drop it silently. ' +
+          'Decide the rule before loading.',
+      );
+    }
+  }
+
+  // --- the top level -------------------------------------------------------
+  // The export is `{ words, progress, sources }`. A fourth key is the same kind
+  // of surprise as a sixth word key, one level up.
+  const strayTopLevel = backup.topLevelKeys.filter((key) => !TOP_LEVEL_KEYS.has(key));
+  if (strayTopLevel.length > 0) {
+    findings.warn(
+      `The export has top-level keys beyond words, progress and sources: ` +
+        `${series(strayTopLevel)}. Nothing reads them.`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Progress records
+// ---------------------------------------------------------------------------
+
+/**
+ * The shape of the 95 records step 9 will insert. Checked here rather than
+ * there, because 5d wants the file to fail before Postgres is opened, and a
+ * malformed `nextReview` is exactly the kind of thing that would otherwise
+ * surface halfway through a transaction.
+ */
+function reportProgressShape(backup: Backup, findings: Findings): void {
+  const malformed: string[] = [];
+  const lowEase: string[] = [];
+  const unrecognised = new Map<string, string[]>();
+  let earliest = Infinity;
+  let latest = -Infinity;
+
+  for (const [word, record] of Object.entries(backup.progress)) {
+    const ease = record['ease'];
+    const repetition = record['repetition'];
+    const nextReview = record['nextReview'];
+
+    const timestamp = typeof nextReview === 'string' ? Date.parse(nextReview) : NaN;
+
+    if (
+      typeof ease !== 'number' ||
+      !Number.isInteger(repetition) ||
+      Number.isNaN(timestamp)
+    ) {
+      malformed.push(word);
+      continue;
+    }
+
+    if (ease < EASE_FLOOR) lowEase.push(word);
+    earliest = Math.min(earliest, timestamp);
+    latest = Math.max(latest, timestamp);
+
+    for (const key of Object.keys(record)) {
+      if (PROGRESS_KEYS.has(key)) continue;
+      const carriers = unrecognised.get(key) ?? [];
+      carriers.push(word);
+      unrecognised.set(key, carriers);
+    }
+  }
+
+  console.log('\nProgress records');
+
+  claim(
+    findings,
+    malformed.length === 0,
+    `all ${n(Object.keys(backup.progress).length)} hold a numeric ease, an integer ` +
+      'repetition and a parseable nextReview.',
+    `${count(malformed.length, 'progress record')} ${malformed.length === 1 ? 'is' : 'are'} ` +
+      `malformed: ${series(malformed)}. ` +
+      'Step 9 converts nextReview to timestamptz and cannot do so from these.',
+  );
+
+  if (Number.isFinite(earliest) && Number.isFinite(latest)) {
+    const day = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
+    console.log(`        nextReview spans ${day(earliest)} to ${day(latest)}.`);
+  }
+
+  for (const [key, carriers] of [...unrecognised].sort()) {
+    findings.warn(
+      `Unrecognised key \`${key}\` inside ${count(carriers.length, 'progress record')}: ` +
+        `${series(carriers)}. A progress record should hold only ease, repetition ` +
+        'and nextReview.',
+    );
+  }
+
+  if (lowEase.length > 0) {
+    findings.warn(
+      `${count(lowEase.length, 'progress record')} ${lowEase.length === 1 ? 'sits' : 'sit'} ` +
+        `below SM-2's ease floor of ${EASE_FLOOR}: ${series(lowEase)}. Understood but ` +
+        'unexpected — the algorithm should not go there.',
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,21 +702,22 @@ function reportSource(sourcePath: string, bytes: number): void {
 }
 
 /** Print the findings and return the exit code. */
-function reportFindings(findings: Findings): number {
+function reportFindings(findings: Findings, strict: boolean): number {
   for (const failure of findings.failures) {
     console.log(`\nFAIL  ${failure}`);
   }
   for (const warning of findings.warnings) {
-    console.log(`\nWARN  ${warning}`);
+    console.log(`\n${strict ? 'WARN (strict: fails)' : 'WARN'}  ${warning}`);
   }
 
-  const failed = findings.failures.length > 0;
-  const verdict = failed ? 'FAIL' : 'PASS';
+  const promoted = strict && findings.warnings.length > 0;
+  const failed = findings.failures.length > 0 || promoted;
 
-  console.log(
-    `\nResult: ${verdict} — ${n(findings.failures.length)} failure(s), ` +
-      `${n(findings.warnings.length)} warning(s).\n`,
-  );
+  const tally =
+    `${count(findings.failures.length, 'failure')}, ${count(findings.warnings.length, 'warning')}` +
+    (promoted ? ', promoted to failures by --strict' : '');
+
+  console.log(`\nResult: ${failed ? 'FAIL' : 'PASS'} — ${tally}.\n`);
 
   return failed ? 1 : 0;
 }
@@ -464,13 +728,17 @@ function reportFindings(findings: Findings): number {
 
 interface Args {
   readonly source: string;
+  readonly strict: boolean;
 }
 
 function usage(): never {
   console.error(`
 Read a Lexicon backup, validate it, and print what is in it. Writes nothing.
 
-  node server/scripts/import-json.ts <path-to-backup.json>
+  node server/scripts/import-json.ts <path-to-backup.json> [--strict]
+
+    --strict   treat every warning as a failure. Off during the build, on at
+               cutover, when "understood but unexpected" stops being tolerable.
 
 The path is required and has no default. The file of record is
 lexicon-backup-2026-08-03-b.json (2,037,770 bytes) — NOT the smaller
@@ -481,9 +749,12 @@ lexicon-backup-2026-08-03.json that sits beside it.
 
 function parseArgs(argv: readonly string[]): Args {
   let source: string | null = null;
+  let strict = false;
 
   for (const arg of argv) {
-    if (arg.startsWith('--')) {
+    if (arg === '--strict') {
+      strict = true;
+    } else if (arg.startsWith('--')) {
       console.error(`Unknown option: ${arg}`);
       process.exit(1);
     } else if (source === null) {
@@ -495,7 +766,7 @@ function parseArgs(argv: readonly string[]): Args {
   }
 
   if (source === null) usage();
-  return { source };
+  return { source, strict };
 }
 
 function main(): void {
@@ -506,11 +777,15 @@ function main(): void {
   const findings = new Findings();
 
   reportSource(sourcePath, bytes);
+  if (args.strict) console.log('  --strict: warnings will be treated as failures.');
+
   reportCounts(backup, findings);
   reportCoverage(backup, findings);
   reportStructure(backup, findings);
+  reportStrayKeys(backup, findings);
+  reportProgressShape(backup, findings);
 
-  process.exit(reportFindings(findings));
+  process.exit(reportFindings(findings, args.strict));
 }
 
 main();
