@@ -68,6 +68,42 @@ const BASELINE = {
   progress: 95,
 } as const;
 
+/**
+ * How many of the 974 fetched words carry each field, in the order the report
+ * prints them. The gaps are real and they are fine: `bromide` has no
+ * pronunciation, `portentous` no etymology. Fields are independently optional
+ * and a missing one is never a warning.
+ *
+ * `example` (singular) is in this table because it is a field like any other
+ * when you are counting coverage. It is also a stray key with no column, which
+ * is a separate matter, handled in the stray-key report.
+ */
+const COVERAGE: ReadonlyArray<readonly [field: string, expected: number]> = [
+  ['definitions', 974],
+  ['mnemonics', 974],
+  ['part_of_speech', 974],
+  ['usage_note', 974],
+  ['etymology', 973],
+  ['pronunciation', 973],
+  ['examples', 970],
+  ['example', 76],
+];
+
+/** Structural facts about the file, verified 2026-08-04 and frozen with it. */
+const STRUCTURE = {
+  dictionaries: 4,
+  usageGuides: 6,
+  multiWordHeadwords: 62,
+} as const;
+
+/**
+ * Characters that make a headword multi-part: space, hyphen-minus, and the
+ * Unicode hyphens and dashes. `a fortiori`, `coup de grâce`, `will-o'-the-wisp`,
+ * `vis-à-vis` and 58 others. They matter for string matching, so they are
+ * counted rather than assumed.
+ */
+const HEADWORD_SEPARATOR = /[ \-‐‑–—]/;
+
 // ---------------------------------------------------------------------------
 // Shapes. Everything off the disk is `unknown` until it has been checked —
 // JSON.parse promises nothing, and the whole job of this script is to stop
@@ -224,6 +260,172 @@ function reportCounts(backup: Backup, findings: Findings): void {
 }
 
 // ---------------------------------------------------------------------------
+// Field coverage (5g)
+// ---------------------------------------------------------------------------
+
+/**
+ * A field counts as present if the key exists and holds something other than
+ * null. Absent and null are the same thing here — both become a NULL column at
+ * step 6, and both are normal.
+ */
+function hasField(word: WordRecord, field: string): boolean {
+  const value = word[field];
+  return value !== undefined && value !== null;
+}
+
+function reportCoverage(backup: Backup, findings: Findings): void {
+  const fetched = backup.words.filter(isFetched);
+
+  console.log(`\nField coverage, of ${n(fetched.length)} fetched`);
+  console.log(`  ${''.padEnd(24)}${'found'.padStart(7)}${'expected'.padStart(12)}`);
+
+  for (const [field, expected] of COVERAGE) {
+    const found = fetched.filter((word) => hasField(word, field)).length;
+    const label = field === 'example' ? 'example (singular)' : field;
+    console.log(countLine(label, found, expected));
+
+    if (found !== expected) {
+      findings.fail(
+        `Field coverage for \`${field}\` is ${n(found)}, not the frozen ${n(expected)}.`,
+      );
+    }
+  }
+
+  // Coverage is quoted "of the 974 fetched", which is only the whole story if
+  // the unfetched 96 carry nothing. They carry nothing but `word` — checked
+  // rather than assumed, because a definition field on an unfetched word would
+  // mean `definitions` is not the marker the whole script relies on.
+  const strayOnUnfetched = new Set<string>();
+  for (const word of backup.words) {
+    if (isFetched(word)) continue;
+    for (const key of Object.keys(word)) {
+      if (key !== 'word') strayOnUnfetched.add(key);
+    }
+  }
+
+  if (strayOnUnfetched.size === 0) {
+    console.log('\n  The 96 unfetched words carry the `word` key and nothing else.');
+  } else {
+    findings.fail(
+      'Unfetched words carry fields beyond `word`: ' +
+        `${[...strayOnUnfetched].sort().join(', ')}. ` +
+        '`definitions` may not be the fetched/unfetched marker after all.',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Structural facts
+// ---------------------------------------------------------------------------
+
+/** One structural claim: printed either way, a failure when it does not hold. */
+function claim(findings: Findings, holds: boolean, line: string, onFailure: string): void {
+  console.log(`  ${holds ? 'ok  ' : 'FAIL'}  ${line}`);
+  if (!holds) findings.fail(onFailure);
+}
+
+function reportStructure(backup: Backup, findings: Findings): void {
+  console.log('\nStructure');
+
+  // --- sources: an object of two arrays, not the flat array once assumed ----
+  const dictionaries = backup.sources['dictionaries'];
+  const usageGuides = backup.sources['usageGuides'];
+  const dictCount = Array.isArray(dictionaries) ? dictionaries.length : -1;
+  const guideCount = Array.isArray(usageGuides) ? usageGuides.length : -1;
+
+  claim(
+    findings,
+    dictCount === STRUCTURE.dictionaries && guideCount === STRUCTURE.usageGuides,
+    `sources is an object of two arrays: dictionaries ${dictCount}, usageGuides ${guideCount} ` +
+      `(expected ${STRUCTURE.dictionaries} and ${STRUCTURE.usageGuides}).`,
+    'sources is not the two-array object 24k describes. The schema stores it as two ' +
+      'text[] columns, so this shape is load-bearing.',
+  );
+  console.log('        usageGuides is the file\'s one camelCase key; it becomes usage_guides.');
+
+  // --- headwords -----------------------------------------------------------
+  const headwords = backup.words.map((word) => word['word']);
+  const allStrings = headwords.every((word) => typeof word === 'string');
+
+  claim(
+    findings,
+    allStrings,
+    `every one of the ${n(headwords.length)} records has a string \`word\`.`,
+    'Some records have a missing or non-string `word`. The headword is the public ' +
+      'identity of a record (24a); nothing can be loaded without it.',
+  );
+
+  if (!allStrings) return;
+  const words = headwords as string[];
+
+  const capitalized = words.filter((word) => word !== word.toLowerCase());
+  claim(
+    findings,
+    capitalized.length === 0,
+    `all ${n(words.length)} headwords are lowercase, zero exceptions.`,
+    `${n(capitalized.length)} headwords are not lowercase: ${capitalized.slice(0, 5).join(', ')}. ` +
+      '26a assumes it supplies every capital that will ever exist in the library.',
+  );
+
+  const distinct = new Set(words.map((word) => word.toLowerCase()));
+  claim(
+    findings,
+    distinct.size === words.length,
+    `all ${n(words.length)} headwords are distinct, compared case-insensitively.`,
+    `${n(words.length - distinct.size)} headwords collide case-insensitively. The unique ` +
+      'index words_user_word_lower (24h) would reject them at step 6.',
+  );
+
+  const multiWord = words.filter((word) => HEADWORD_SEPARATOR.test(word));
+  claim(
+    findings,
+    multiWord.length === STRUCTURE.multiWordHeadwords,
+    `${n(multiWord.length)} headwords are multi-word or hyphenated ` +
+      `(expected ${n(STRUCTURE.multiWordHeadwords)}).`,
+    `Found ${n(multiWord.length)} multi-word headwords, not the frozen ` +
+      `${n(STRUCTURE.multiWordHeadwords)}.`,
+  );
+
+  // --- progress ------------------------------------------------------------
+  // 24h settled that identity is the lowercase comparison, so progress keys are
+  // resolved case-insensitively here exactly as step 9 will resolve them.
+  const byLower = new Map(words.map((word) => [word.toLowerCase(), word]));
+  const fetchedLower = new Set(
+    backup.words.filter(isFetched).map((word) => String(word['word']).toLowerCase()),
+  );
+
+  const progressKeys = Object.keys(backup.progress);
+  const orphans = progressKeys.filter((key) => !byLower.has(key.toLowerCase()));
+  const atUnfetched = progressKeys.filter(
+    (key) => byLower.has(key.toLowerCase()) && !fetchedLower.has(key.toLowerCase()),
+  );
+
+  claim(
+    findings,
+    orphans.length === 0,
+    `all ${n(progressKeys.length)} progress records resolve to a headword.`,
+    `${n(orphans.length)} progress records point at no word: ${orphans.slice(0, 5).join(', ')}.`,
+  );
+
+  claim(
+    findings,
+    atUnfetched.length === 0,
+    'no progress record points at an unfetched word.',
+    `${n(atUnfetched.length)} progress records point at unfetched words: ` +
+      `${atUnfetched.slice(0, 5).join(', ')}.`,
+  );
+
+  const exact = progressKeys.filter((key) => byLower.get(key.toLowerCase()) === key).length;
+  const inexact = progressKeys.length - exact;
+  console.log(
+    inexact === 0
+      ? `        All ${n(exact)} match their headword exactly, so the case-insensitive ` +
+          'match changes nothing today. Step 9 needs it anyway, once 26a adds capitals.'
+      : `        ${n(exact)} match exactly; ${n(inexact)} need the case-insensitive match.`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
 
@@ -305,6 +507,8 @@ function main(): void {
 
   reportSource(sourcePath, bytes);
   reportCounts(backup, findings);
+  reportCoverage(backup, findings);
+  reportStructure(backup, findings);
 
   process.exit(reportFindings(findings));
 }
