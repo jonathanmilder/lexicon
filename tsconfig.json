@@ -1,0 +1,38 @@
+{
+  // Node 24 runs .ts files directly by stripping type annotations. It does not check
+  // them. TypeScript is here purely as a checker: `npm run typecheck`, never a build.
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2024",
+    "lib": ["es2024"],
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+
+    // Never emit JavaScript. Node is the only thing that runs this code.
+    "noEmit": true,
+
+    // Node's ESM requires the real extension in an import specifier ('./x.ts'),
+    // which TypeScript rejects by default.
+    "allowImportingTsExtensions": true,
+
+    // Reject any TypeScript syntax Node cannot simply erase — enums, namespaces,
+    // parameter properties. Turns a runtime crash into a checker error.
+    "erasableSyntaxOnly": true,
+
+    // Imports mean exactly what they say; `import type` is always erased.
+    "verbatimModuleSyntax": true,
+
+    // Lets a default import work against a CommonJS package such as `pg`.
+    "esModuleInterop": true,
+
+    // The Q19 defence, in the checker: a mis-cased import fails here on Windows
+    // instead of failing at deploy time on Linux.
+    "forceConsistentCasingInFileNames": true,
+
+    "skipLibCheck": true
+  },
+  "include": ["server/**/*.ts"]
+}
