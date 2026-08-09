@@ -4,38 +4,52 @@
  * WHAT THIS IS FOR
  * ----------------
  * The v3.1 artifact's library lives in a JSON export. This script is what moves
- * it into Postgres. It is built across three steps, and only the FIRST of them
- * exists today:
+ * it into Postgres. It is built across three steps, and TWO of them exist today:
  *
- *   step 5  read the file, validate it, print what is there.   <- this is all
- *   step 6  insert the user, the settings, and the 1,070 words.
- *   step 9  insert the 95 progress records.
+ *   step 5  read the file, validate it, print what is there.   <- done
+ *   step 6  insert the user, the settings, and the 1,070 words. <- done
+ *   step 9  insert the 95 progress records.                     <- not yet
  *
- * SO: THIS SCRIPT DOES NOT TOUCH A DATABASE.
- * It does not import `pg`. It does not read DATABASE_URL, DATABASE_URL_DEV, or
- * DATABASE_URL_MAIN. It takes no --target. Two reasons, both deliberate:
- *
- *   1. 5d puts "fail before touching the database" first. A validator that needs
- *      a live connection cannot be run casually, and this one should be run
- *      fifty times while the reporting gets right.
- *   2. Q21: every connection wakes Neon's compute and spends from a 100 CU-hour
- *      monthly bucket that `dev` and `main` share. A file-only step costs nothing
- *      to iterate on.
- *
- * WHAT IT READS
+ * HOW TO RUN IT
  * -------------
- *   node server/scripts/import-json.ts <path-to-backup.json>
+ *   node --env-file=.env server/scripts/import-json.ts \
+ *        <path-to-backup.json> --target dev|main [--dry-run] [--strict]
  *
  * No runner and no build step: Node 24 executes .ts directly by stripping the
  * type annotations. It does not check them — `npm run typecheck` does that.
  *
- * The path is required and has NO DEFAULT. Two backup files sit side by side in
- * Dropbox and only the larger one is the file of record:
+ * TWO ARGUMENTS, NEITHER WITH A DEFAULT (5c, Q18)
+ * -----------------------------------------------
+ * The FILE PATH has no default. Two backup files sit side by side in Dropbox and
+ * only the larger one is the file of record:
  *
  *   lexicon-backup-2026-08-03-b.json   2,037,770 bytes   <- this one
  *   lexicon-backup-2026-08-03.json     1,302,925 bytes   <- NOT this one
  *
  * A default is how the wrong one gets read silently.
+ *
+ * --target has no default AND NO FALLBACK. It selects DATABASE_URL_DEV or
+ * DATABASE_URL_MAIN. It never reads DATABASE_URL — that variable belongs to the
+ * server, which is not allowed to choose a database, whereas this program is the
+ * one that runs TRUNCATE and must be told out loud. A command retyped without
+ * --target stops for lack of a target rather than assuming one; that guard is
+ * what made deferring --dry-run from step 5 to step 6 safe, so removing it later
+ * silently invalidates a decision made elsewhere.
+ *
+ * --target main additionally requires a typed confirmation.
+ *
+ * WHAT IT WRITES (5d, steps 3 to 5 of the sequence)
+ * -------------------------------------------------
+ * Inside ONE transaction: TRUNCATE the four application tables, insert the single
+ * users row and its user_settings row, then insert all 1,070 words verbatim with
+ * 26a's accepted corrections and Q27's five rules applied.
+ *
+ * schema_migrations is NOT truncated. It belongs to the migration runner (Q28);
+ * emptying it would make the database and the repo disagree, silently.
+ *
+ * --dry-run runs the whole transaction and then ROLLs BACK instead of
+ * COMMITting. The point is to exercise every write and every constraint and
+ * throw the result away — not to skip the writes.
  *
  * WHAT COUNTS AS FAILURE (5e)
  * ---------------------------
@@ -54,7 +68,34 @@
  */
 
 import { readFileSync, statSync } from 'node:fs';
+import { createInterface } from 'node:readline/promises';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import pg from 'pg';
+import type { Client as PgClient } from 'pg';
+import { buildConnectionConfig, describeTarget, describeTls } from '../src/db-config.ts';
+
+const { Client } = pg;
+
+/** The repo root, found from this file rather than from the current directory. */
+const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+/** 26a's decisions file. The loader applies only entries marked `accepted`. */
+const CORRECTIONS_PATH = path.join(REPO_ROOT, 'data', 'capitalizations.json');
+
+/**
+ * --target selects one of these and nothing else. DATABASE_URL is deliberately
+ * absent: it is the server's variable, and the server never chooses a database.
+ */
+const TARGET_VARIABLES = {
+  dev: 'DATABASE_URL_DEV',
+  main: 'DATABASE_URL_MAIN',
+} as const;
+
+type Target = keyof typeof TARGET_VARIABLES;
+
+/** What must be typed, in full, before anything is written to main. */
+const MAIN_CONFIRMATION = 'load main';
 
 // ---------------------------------------------------------------------------
 // The frozen baseline. Read from lexicon-backup-2026-08-03-b.json on 2026-08-04
@@ -392,7 +433,12 @@ function reportCoverage(backup: Backup, findings: Findings): void {
   }
 
   if (strayOnUnfetched.size === 0) {
-    console.log('\n  The 96 unfetched words carry the `word` key and nothing else.');
+    // Counted, not quoted: on the wrong file this line would otherwise claim 96
+    // while the counts table above it reported 408.
+    const unfetched = backup.words.length - fetched.length;
+    console.log(
+      `\n  The ${n(unfetched)} unfetched words carry the \`word\` key and nothing else.`,
+    );
   } else {
     findings.fail(
       'Unfetched words carry fields beyond `word`: ' +
@@ -689,16 +735,570 @@ function reportProgressShape(backup: Backup, findings: Findings): void {
 }
 
 // ---------------------------------------------------------------------------
+// 26a — the capitalization corrections
+//
+// All 1,070 headwords in the file are lowercase, so this file supplies every
+// capital the library will ever have. The hand review is a SOFT dependency: the
+// loader is re-runnable, so an early run legitimately applies few or none. What
+// it must not do is apply an entry nobody has looked at.
+// ---------------------------------------------------------------------------
+
+interface Corrections {
+  /** lower(word) -> the verbatim headword to store. Accepted entries only. */
+  readonly accepted: ReadonlyMap<string, string>;
+  /** Every status found, and how many entries carry it. */
+  readonly byStatus: ReadonlyMap<string, number>;
+  readonly total: number;
+}
+
+function readCorrections(findings: Findings): Corrections {
+  const accepted = new Map<string, string>();
+  const byStatus = new Map<string, number>();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(CORRECTIONS_PATH, 'utf8'));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    findings.fail(
+      `Could not read ${path.relative(REPO_ROOT, CORRECTIONS_PATH)}: ${message}. ` +
+        '26a is an explicit step of the load, so a missing or unparseable decisions ' +
+        'file is a stop, not a silent skip.',
+    );
+    return { accepted, byStatus, total: 0 };
+  }
+
+  const root = parsed as Record<string, unknown>;
+  const entries = root['corrections'];
+
+  if (typeof entries !== 'object' || entries === null || Array.isArray(entries)) {
+    findings.fail('The corrections file has no `corrections` object.');
+    return { accepted, byStatus, total: 0 };
+  }
+
+  for (const [key, value] of Object.entries(entries as Record<string, unknown>)) {
+    if (typeof value !== 'object' || value === null) {
+      findings.fail(`Correction \`${key}\` is not an object.`);
+      continue;
+    }
+
+    const entry = value as Record<string, unknown>;
+    const status = typeof entry['status'] === 'string' ? entry['status'] : '(no status)';
+    byStatus.set(status, (byStatus.get(status) ?? 0) + 1);
+
+    if (status !== 'accepted') continue;
+
+    const capitalization = entry['capitalization'];
+    if (typeof capitalization !== 'string' || capitalization.length === 0) {
+      findings.fail(`Correction \`${key}\` is accepted but has no \`capitalization\` string.`);
+      continue;
+    }
+
+    // A capitalization changes case and nothing else. Anything else is a rename,
+    // which would silently retitle an entry — and 26a is not a renaming tool.
+    if (capitalization.toLowerCase() !== key.toLowerCase()) {
+      findings.fail(
+        `Correction \`${key}\` is accepted but proposes \`${capitalization}\`, which ` +
+          'differs by more than case. That is a rename, not a capitalization.',
+      );
+      continue;
+    }
+
+    accepted.set(key.toLowerCase(), capitalization);
+  }
+
+  return { accepted, byStatus, total: Object.keys(entries as object).length };
+}
+
+// ---------------------------------------------------------------------------
+// The write plan — every transformation, applied in memory, before any
+// connection is opened. 5d wants failure to happen at the cheapest moment, and
+// a row that cannot be built is cheaper to find here than mid-transaction.
+// ---------------------------------------------------------------------------
+
+/** One row of `words`, in schema terms rather than in the file's terms. */
+interface WordRow {
+  readonly word: string;
+  readonly partOfSpeech: string | null;
+  readonly pronunciation: string | null;
+  readonly definitions: string[] | null;
+  readonly etymology: string | null;
+  readonly usageNote: string | null;
+  readonly examples: string[] | null;
+  readonly mnemonics: string | null;
+}
+
+/** What Q27's five rules actually did, by word, for the named report lines. */
+interface StrayKeyOutcome {
+  readonly examplesSuperseded: string[];
+  readonly examplePromoted: string[];
+  readonly etymologyNoteAppended: string[];
+  readonly pronunciationNoteAppended: string[];
+  readonly definitonsDiscarded: string[];
+  readonly confusablesDiscarded: string[];
+}
+
+interface WritePlan {
+  readonly rows: readonly WordRow[];
+  readonly dictionaries: string[];
+  readonly usageGuides: string[];
+  readonly stray: StrayKeyOutcome;
+  /** The headwords 26a actually changed, as `word -> Word`. */
+  readonly capitalized: string[];
+}
+
+/** A string, or null. Absent and null both become a NULL column. */
+function textOrNull(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+/**
+ * A `text[]`, or null. An array holding anything but strings is a failure rather
+ * than something to coerce: `text[]` cannot hold it, and silently stringifying a
+ * value is exactly the kind of quiet damage this script exists to prevent.
+ */
+function textArrayOrNull(
+  value: unknown,
+  word: string,
+  field: string,
+  findings: Findings,
+): string[] | null {
+  if (!Array.isArray(value)) return null;
+
+  const offenders = value.filter((element) => typeof element !== 'string');
+  if (offenders.length > 0) {
+    findings.fail(
+      `\`${field}\` on ${word} holds ${count(offenders.length, 'non-string value')}. ` +
+        'The column is text[] and cannot hold it.',
+    );
+    return null;
+  }
+
+  return value as string[];
+}
+
+/**
+ * Q27: `etymology_note` and `pronunciation_note` are appended to the field they
+ * annotate, separated by a blank line. If the field itself is missing the note
+ * becomes the whole value — the ordinary consequence of the rule, not a case.
+ */
+function appendNote(base: string | null, note: unknown): string | null {
+  if (typeof note !== 'string' || note.length === 0) return base;
+  return base === null || base.length === 0 ? note : `${base}\n\n${note}`;
+}
+
+function buildWritePlan(
+  backup: Backup,
+  corrections: Corrections,
+  findings: Findings,
+): WritePlan {
+  const rows: WordRow[] = [];
+  const capitalized: string[] = [];
+  const stray: StrayKeyOutcome = {
+    examplesSuperseded: [],
+    examplePromoted: [],
+    etymologyNoteAppended: [],
+    pronunciationNoteAppended: [],
+    definitonsDiscarded: [],
+    confusablesDiscarded: [],
+  };
+
+  const seenLower = new Set<string>();
+
+  for (const record of backup.words) {
+    const original = textOrNull(record['word']);
+    if (original === null) continue; // already a failure in reportStructure
+
+    // --- 26a ---------------------------------------------------------------
+    // Words are stored VERBATIM (24h). The only thing that changes a headword on
+    // the way in is an accepted correction.
+    const correction = corrections.accepted.get(original.toLowerCase());
+    const word = correction ?? original;
+    if (correction !== undefined && correction !== original) {
+      capitalized.push(`${original} -> ${correction}`);
+    }
+    seenLower.add(word.toLowerCase());
+
+    // --- Q27: `examples` wins outright; `example` is a FALLBACK, not a merge --
+    const plural = textArrayOrNull(record['examples'], word, 'examples', findings);
+    const singular = textOrNull(record['example']);
+
+    let examples: string[] | null;
+    if (plural !== null && plural.length > 0) {
+      examples = plural;
+      if (singular !== null) stray.examplesSuperseded.push(word);
+    } else if (singular !== null) {
+      examples = [singular];
+      stray.examplePromoted.push(word);
+    } else {
+      examples = plural;
+    }
+
+    // --- Q27: the two notes are appended to what they annotate ---------------
+    let etymology = textOrNull(record['etymology']);
+    if (record['etymology_note'] !== undefined) {
+      etymology = appendNote(etymology, record['etymology_note']);
+      stray.etymologyNoteAppended.push(word);
+    }
+
+    let pronunciation = textOrNull(record['pronunciation']);
+    if (record['pronunciation_note'] !== undefined) {
+      pronunciation = appendNote(pronunciation, record['pronunciation_note']);
+      stray.pronunciationNoteAppended.push(word);
+    }
+
+    // --- Q27: the two discards, named rather than silent ---------------------
+    if (record['definitons'] !== undefined) stray.definitonsDiscarded.push(word);
+    if (record['confusables'] !== undefined) stray.confusablesDiscarded.push(word);
+
+    rows.push({
+      word,
+      partOfSpeech: textOrNull(record['part_of_speech']),
+      pronunciation,
+      definitions: textArrayOrNull(record['definitions'], word, 'definitions', findings),
+      etymology,
+      usageNote: textOrNull(record['usage_note']),
+      examples,
+      mnemonics: textOrNull(record['mnemonics']),
+    });
+  }
+
+  // An accepted correction for a word that is not in the file means the two
+  // files have drifted apart. Loud, because the capital would simply never land.
+  for (const key of corrections.accepted.keys()) {
+    if (!seenLower.has(key)) {
+      findings.fail(
+        `Correction \`${key}\` is accepted but no such headword is in the backup. ` +
+          'The corrections file and the backup disagree.',
+      );
+    }
+  }
+
+  // 24k: the loader's one camelCase translation, and the only translation it
+  // performs. Order is preserved — the fetch prompt lists these sources in order.
+  const dictionaries = textArrayOrNull(
+    backup.sources['dictionaries'],
+    'sources',
+    'dictionaries',
+    findings,
+  );
+  const usageGuides = textArrayOrNull(
+    backup.sources['usageGuides'],
+    'sources',
+    'usageGuides',
+    findings,
+  );
+
+  return {
+    rows,
+    dictionaries: dictionaries ?? [],
+    usageGuides: usageGuides ?? [],
+    stray,
+    capitalized,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------
+
+/**
+ * The four APPLICATION tables, named explicitly.
+ *
+ * schema_migrations is deliberately absent. It records which migration files
+ * have been applied, and it belongs to the migration runner (Q28). Emptying it
+ * here would leave the database and the repo disagreeing with each other, with
+ * nothing to say so — and the runner would then re-apply 001 against tables that
+ * already exist.
+ *
+ * RESTART IDENTITY is what makes the users row come back as id 1 on every run.
+ * CASCADE is redundant while these four are the only tables, and is kept because
+ * the day it stops being redundant is the day it is needed.
+ */
+const TRUNCATE_APPLICATION_TABLES =
+  'TRUNCATE users, user_settings, words, progress RESTART IDENTITY CASCADE';
+
+/** The columns of `words` this loader fills. created_at takes its default. */
+const WORD_COLUMNS = [
+  'user_id',
+  'word',
+  'part_of_speech',
+  'pronunciation',
+  'definitions',
+  'etymology',
+  'usage_note',
+  'examples',
+  'mnemonics',
+] as const;
+
+/**
+ * Rows per INSERT. 1,070 single-row inserts would be 1,070 round trips to
+ * us-east-2; at nine columns a batch of 200 is 1,800 parameters, well under
+ * Postgres's limit of 65,535.
+ */
+const WORD_BATCH_SIZE = 200;
+
+/**
+ * `INSERT INTO words (...) VALUES ($1,...,$9), ($10,...,$18), ... RETURNING id, word`
+ *
+ * The placeholders are generated because their count depends on the batch size,
+ * but the VALUES are still parameters — the headwords never enter the SQL text.
+ */
+function insertWordsSql(rowCount: number): string {
+  const tuples: string[] = [];
+
+  for (let row = 0; row < rowCount; row += 1) {
+    const first = row * WORD_COLUMNS.length;
+    const placeholders = WORD_COLUMNS.map((_, column) => `$${first + column + 1}`);
+    tuples.push(`(${placeholders.join(', ')})`);
+  }
+
+  return (
+    `INSERT INTO words (${WORD_COLUMNS.join(', ')})\n` +
+    `VALUES ${tuples.join(', ')}\n` +
+    'RETURNING id, word'
+  );
+}
+
+interface WriteOutcome {
+  readonly userId: string;
+  readonly wordsInserted: number;
+  /** lower(word) -> words.id. Step 9 resolves progress records through this. */
+  readonly wordIds: ReadonlyMap<string, string>;
+  readonly committed: boolean;
+}
+
+/**
+ * The extra diagnostic fields node-postgres hangs off a database error.
+ * migrate.ts has its own copy of this; at step 7a there will be a third caller
+ * and it is worth extracting then. Two copies is not yet a module.
+ */
+interface PostgresErrorFields {
+  code?: string;
+  detail?: string;
+  hint?: string;
+  constraint?: string;
+}
+
+function formatDatabaseError(error: unknown): string {
+  if (!(error instanceof Error)) return `  ${String(error)}`;
+
+  const fields = error as Error & PostgresErrorFields;
+  const lines = [`  ${error.message}`];
+
+  for (const key of ['code', 'detail', 'hint', 'constraint'] as const) {
+    const value = fields[key];
+    if (value) lines.push(`  ${key}: ${value}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Everything from the TRUNCATE onward, in ONE transaction.
+ *
+ * --dry-run does not skip any of this. It runs every statement and then rolls
+ * back, so the constraints, the types and the unique index are all exercised
+ * against the real data and the result is thrown away.
+ */
+async function writeAll(
+  client: PgClient,
+  plan: WritePlan,
+  dryRun: boolean,
+): Promise<WriteOutcome> {
+  await client.query('BEGIN');
+
+  console.log('\nWriting');
+  await client.query(TRUNCATE_APPLICATION_TABLES);
+  console.log('  truncated users, user_settings, words, progress (schema_migrations untouched)');
+
+  // 24i: one users row, email deliberately NULL. It is unused in leg one and
+  // kept because Q8 leans toward email-link auth.
+  //
+  // pg returns bigint as a string, because a Postgres bigint can hold values a
+  // JavaScript number cannot represent exactly. Hence Number() rather than ===.
+  const inserted = await client.query<{ id: string }>(
+    'INSERT INTO users (email) VALUES (NULL) RETURNING id',
+  );
+  const userId = inserted.rows[0]?.id;
+
+  if (userId === undefined || Number(userId) !== 1) {
+    throw new Error(
+      `The users row came back as id ${String(userId)}, not 1. The server reads ` +
+        'DEFAULT_USER_ID=1, so this would present as an app with no words rather ' +
+        'than as an error. Refusing to continue.',
+    );
+  }
+  console.log(`  users: id ${userId}, email NULL (unused in leg one, 24i)`);
+
+  // 24k: the camelCase-to-snake_case rename, and the loader's only translation.
+  await client.query(
+    'INSERT INTO user_settings (user_id, dictionaries, usage_guides) VALUES ($1, $2, $3)',
+    [userId, plan.dictionaries, plan.usageGuides],
+  );
+  console.log(
+    `  user_settings: ${count(plan.dictionaries.length, 'dictionary', 'dictionaries')}, ` +
+      `${count(plan.usageGuides.length, 'usage guide')}, order preserved`,
+  );
+
+  // The word -> id map. Step 6 does not use it; step 9 resolves progress records
+  // through it, case-insensitively (24h). It is built from RETURNING rather than
+  // from insertion order, which Postgres does not promise for a multi-row INSERT.
+  const wordIds = new Map<string, string>();
+
+  for (let offset = 0; offset < plan.rows.length; offset += WORD_BATCH_SIZE) {
+    const batch = plan.rows.slice(offset, offset + WORD_BATCH_SIZE);
+    const values: unknown[] = [];
+
+    for (const row of batch) {
+      values.push(
+        userId,
+        row.word,
+        row.partOfSpeech,
+        row.pronunciation,
+        row.definitions,
+        row.etymology,
+        row.usageNote,
+        row.examples,
+        row.mnemonics,
+      );
+    }
+
+    const result = await client.query<{ id: string; word: string }>(
+      insertWordsSql(batch.length),
+      values,
+    );
+
+    for (const returned of result.rows) {
+      wordIds.set(returned.word.toLowerCase(), returned.id);
+    }
+  }
+
+  console.log(`  words: ${count(plan.rows.length, 'row')} inserted`);
+
+  if (wordIds.size !== plan.rows.length) {
+    throw new Error(
+      `The word -> id map holds ${n(wordIds.size)} entries for ${n(plan.rows.length)} rows. ` +
+        'Step 9 resolves every progress record through it, so it must be complete.',
+    );
+  }
+  console.log(`  word -> id map: ${count(wordIds.size, 'entry', 'entries')} (step 9 reads this)`);
+
+  if (dryRun) {
+    await client.query('ROLLBACK');
+  } else {
+    await client.query('COMMIT');
+  }
+
+  return { userId, wordsInserted: plan.rows.length, wordIds, committed: !dryRun };
+}
+
+// ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
 
-function reportSource(sourcePath: string, bytes: number): void {
-  console.log('\nimport-json — read and validate (step 5).');
-  console.log('No database is opened and nothing is written.');
+/**
+ * Everything the run resolved, printed before it does anything at all. Both the
+ * target and the file path are arguments with no default, so seeing what they
+ * resolved to is the last check before a TRUNCATE.
+ */
+function reportResolved(args: Args, sourcePath: string, connectionString: string): void {
+  console.log('\nimport-json — load words (step 6).');
+  console.log('\nResolved, before anything happens');
+  console.log(`  target       ${args.target}  ->  ${TARGET_VARIABLES[args.target]}`);
+  console.log(`  database     ${describeTarget(connectionString)}`);
+  console.log(`  TLS          ${describeTls(connectionString)}`);
+  console.log(`  file         ${sourcePath}`);
+  console.log(
+    args.dryRun
+      ? '  mode         DRY RUN — every write runs, then ROLLBACK'
+      : '  mode         WRITE — the transaction is COMMITted',
+  );
+  if (args.strict) console.log('  --strict     warnings are treated as failures');
+}
+
+function reportSize(sourcePath: string, bytes: number): void {
   console.log('\nSource');
   console.log(`  ${path.basename(sourcePath)}`);
   console.log(`  ${n(bytes)} bytes`);
-  console.log(`  ${sourcePath}`);
+}
+
+function reportCorrections(corrections: Corrections, plan: WritePlan): void {
+  console.log('\nCapitalization corrections (26a)');
+  console.log(`  ${count(corrections.total, 'entry', 'entries')} in ` +
+    `${path.relative(REPO_ROOT, CORRECTIONS_PATH).replace(/\\/g, '/')}`);
+
+  for (const [status, howMany] of [...corrections.byStatus].sort()) {
+    const effect = status === 'accepted' ? 'applied' : 'skipped';
+    console.log(`  ${String(howMany).padStart(4)} ${status.padEnd(12)} ${effect}`);
+  }
+
+  if (plan.capitalized.length === 0) {
+    console.log('\n  No headword changed. The hand review is a soft dependency: the loader is');
+    console.log('  re-runnable, so an early run applies few or none and a later run picks them up.');
+  } else {
+    console.log(`\n  ${count(plan.capitalized.length, 'headword')} capitalized:`);
+    console.log(`  ${series(plan.capitalized, 12)}.`);
+  }
+}
+
+/**
+ * Q27's five rules, and what each one did. These are NAMED REPORT LINES, not
+ * warnings: all five are in the frozen file forever, so warning on them would
+ * make --strict fail every run by construction. An alarm that always sounds is
+ * not an alarm. The warning is reserved for a SIXTH, unrecognised key.
+ */
+function reportStrayKeyOutcomes(plan: WritePlan): void {
+  const { stray } = plan;
+
+  console.log('\nQ27 — the five stray keys, as applied');
+
+  const line = (label: string, howMany: number, what: string): void => {
+    console.log(`  ${label.padEnd(20)}${String(howMany).padStart(4)}  ${what}`);
+  };
+
+  line(
+    'example',
+    stray.examplesSuperseded.length,
+    'discarded, superseded by `examples`',
+  );
+  line('', stray.examplePromoted.length, 'promoted to sole entry');
+  console.log(`                        ${series(stray.examplePromoted)}.`);
+
+  line('etymology_note', stray.etymologyNoteAppended.length, 'appended to `etymology`');
+  console.log(`                        ${series(stray.etymologyNoteAppended)}.`);
+
+  line(
+    'pronunciation_note',
+    stray.pronunciationNoteAppended.length,
+    'appended to `pronunciation`',
+  );
+  console.log(`                        ${series(stray.pronunciationNoteAppended)}.`);
+
+  line('definitons', stray.definitonsDiscarded.length, 'DISCARDED — the typo, holding an array');
+  console.log(`                        key \`definitons\` on ${series(stray.definitonsDiscarded)}.`);
+
+  line('confusables', stray.confusablesDiscarded.length, 'DISCARDED');
+  console.log(`                        ${series(stray.confusablesDiscarded)}.`);
+}
+
+function reportWritePlan(args: Args, plan: WritePlan): void {
+  console.log('\nWrite plan — one transaction, from the TRUNCATE onward');
+  console.log(`  ${TRUNCATE_APPLICATION_TABLES}`);
+  console.log('  schema_migrations is not named and is not touched (Q28).');
+  console.log(`  1 users row, 1 user_settings row, ${count(plan.rows.length, 'word')}.`);
+  console.log(
+    args.dryRun
+      ? '  --dry-run: all of it runs, then ROLLBACK.'
+      : `  This COMMITs against ${args.target}.`,
+  );
+}
+
+function reportOutcome(outcome: WriteOutcome, target: Target): void {
+  if (outcome.committed) {
+    console.log(`\nCOMMITTED. ${target} now holds ${count(outcome.wordsInserted, 'word')}.`);
+  } else {
+    console.log('\nROLLED BACK — --dry-run. Every statement ran; the database is as it was.');
+  }
 }
 
 /** Print the findings and return the exit code. */
@@ -728,19 +1328,29 @@ function reportFindings(findings: Findings, strict: boolean): number {
 
 interface Args {
   readonly source: string;
+  readonly target: Target;
   readonly strict: boolean;
+  readonly dryRun: boolean;
 }
 
-function usage(): never {
+function usage(problem: string): never {
   console.error(`
-Read a Lexicon backup, validate it, and print what is in it. Writes nothing.
+${problem}
 
-  node server/scripts/import-json.ts <path-to-backup.json> [--strict]
+Load a Lexicon backup into Postgres: the user, the settings and 1,070 words.
 
-    --strict   treat every warning as a failure. Off during the build, on at
-               cutover, when "understood but unexpected" stops being tolerable.
+  node --env-file=.env server/scripts/import-json.ts \\
+       <path-to-backup.json> --target dev|main [--dry-run] [--strict]
 
-The path is required and has no default. The file of record is
+    --target    REQUIRED, no default and no fallback. Selects
+                DATABASE_URL_DEV or DATABASE_URL_MAIN. It never reads
+                DATABASE_URL. --target main asks for a typed confirmation.
+    --dry-run   run the entire transaction, then ROLLBACK instead of COMMIT.
+                Nothing is skipped; the result is thrown away.
+    --strict    treat every warning as a failure. Off during the build, on at
+                cutover, when "understood but unexpected" stops being tolerable.
+
+The path is REQUIRED and has no default. The file of record is
 lexicon-backup-2026-08-03-b.json (2,037,770 bytes) — NOT the smaller
 lexicon-backup-2026-08-03.json that sits beside it.
 `);
@@ -749,43 +1359,160 @@ lexicon-backup-2026-08-03.json that sits beside it.
 
 function parseArgs(argv: readonly string[]): Args {
   let source: string | null = null;
+  let target: string | null = null;
   let strict = false;
+  let dryRun = false;
 
-  for (const arg of argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index] as string;
+
     if (arg === '--strict') {
       strict = true;
+    } else if (arg === '--dry-run') {
+      dryRun = true;
+    } else if (arg === '--target') {
+      // `--target` with nothing after it must not fall through to a default.
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith('--')) usage('--target needs a value.');
+      target = value;
+      index += 1;
+    } else if (arg.startsWith('--target=')) {
+      target = arg.slice('--target='.length);
     } else if (arg.startsWith('--')) {
-      console.error(`Unknown option: ${arg}`);
-      process.exit(1);
+      usage(`Unknown option: ${arg}`);
     } else if (source === null) {
       source = arg;
     } else {
-      console.error(`Unexpected extra argument: ${arg}`);
-      process.exit(1);
+      usage(`Unexpected extra argument: ${arg}`);
     }
   }
 
-  if (source === null) usage();
-  return { source, strict };
+  if (source === null) usage('No backup file given.');
+
+  // No default, no fallback, no inference. A step-5 command retyped without
+  // --target stops here rather than assuming a database (5g, Q18).
+  if (target === null) usage('No --target given. It has no default: say dev or main.');
+  if (target !== 'dev' && target !== 'main') {
+    usage(`--target must be dev or main, not \`${target}\`.`);
+  }
+
+  return { source, target, strict, dryRun };
 }
 
-function main(): void {
+/**
+ * Q18: --target selects the variable; the variable holds the string. Nothing
+ * falls back to DATABASE_URL, which is the server's and points wherever the
+ * server happens to be pointed.
+ */
+function resolveTarget(target: Target): string {
+  const variable = TARGET_VARIABLES[target];
+  const connectionString = process.env[variable];
+
+  if (!connectionString) {
+    console.error(`\n--target ${target} reads ${variable}, and it is not set.`);
+    console.error('  It belongs in .env — see .env.example for the shape.');
+    console.error('  This command needs --env-file=.env; Node does not read .env on its own.\n');
+    process.exit(1);
+  }
+
+  return connectionString;
+}
+
+/**
+ * 5c: writing to main requires typing something. The dry run asks too — it does
+ * not persist anything, but it does take an ACCESS EXCLUSIVE lock on the live
+ * tables for the length of the transaction, which is not a thing to do to
+ * production by accident.
+ */
+async function confirmMain(dryRun: boolean): Promise<void> {
+  console.log('\n--target main. This is the branch the deployed app reads.');
+  console.log(
+    dryRun
+      ? '  --dry-run rolls back, but the TRUNCATE still locks these tables while it runs.'
+      : '  Its four application tables will be emptied and reloaded.',
+  );
+
+  const input = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await input.question(`\nType \`${MAIN_CONFIRMATION}\` to proceed: `);
+  input.close();
+
+  if (answer.trim() !== MAIN_CONFIRMATION) {
+    console.log('\nNot confirmed. Nothing was written.\n');
+    process.exit(1);
+  }
+}
+
+async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const sourcePath = path.resolve(args.source);
+  const connectionString = resolveTarget(args.target);
+
+  reportResolved(args, sourcePath, connectionString);
 
   const { backup, bytes } = readBackup(sourcePath);
   const findings = new Findings();
 
-  reportSource(sourcePath, bytes);
-  if (args.strict) console.log('  --strict: warnings will be treated as failures.');
+  reportSize(sourcePath, bytes);
 
+  // --- read and validate (step 5). Nothing is opened yet. ------------------
   reportCounts(backup, findings);
   reportCoverage(backup, findings);
   reportStructure(backup, findings);
   reportStrayKeys(backup, findings);
   reportProgressShape(backup, findings);
 
+  // --- build every row in memory (step 6). Still nothing opened. -----------
+  const corrections = readCorrections(findings);
+  const plan = buildWritePlan(backup, corrections, findings);
+
+  reportCorrections(corrections, plan);
+  reportStrayKeyOutcomes(plan);
+  reportWritePlan(args, plan);
+
+  // 5d: fail before the database is touched. Everything above is free; the
+  // moment a connection opens, Neon's compute wakes and a TRUNCATE is one
+  // statement away.
+  const blocked = findings.failures.length > 0 || (args.strict && findings.warnings.length > 0);
+  if (blocked) {
+    console.log('\nStopping before the database is opened. Nothing was written.');
+    process.exit(reportFindings(findings, args.strict));
+  }
+
+  if (args.target === 'main') await confirmMain(args.dryRun);
+
+  const client = new Client(buildConnectionConfig(connectionString));
+
+  try {
+    await client.connect();
+  } catch (error) {
+    console.error(`\nCould not connect to ${args.target}.`);
+    console.error(formatDatabaseError(error));
+    console.error('');
+    process.exit(1);
+  }
+
+  let outcome: WriteOutcome;
+
+  try {
+    outcome = await writeAll(client, plan, args.dryRun);
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // If the failure killed the connection, Postgres has already discarded
+      // the transaction and there is nothing left to undo.
+    }
+    await client.end();
+    console.error('\nFAILED mid-transaction. Everything was rolled back; nothing was written.');
+    console.error(formatDatabaseError(error));
+    console.error('');
+    process.exit(1);
+  }
+
+  await client.end();
+
+  reportOutcome(outcome, args.target);
   process.exit(reportFindings(findings, args.strict));
 }
 
-main();
+await main();
