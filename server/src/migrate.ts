@@ -5,7 +5,9 @@
  * in filename order, each in its own transaction. Records what it applied in a
  * schema_migrations table that it creates itself.
  *
- * Reads DATABASE_URL and nothing else. It never chooses a database.
+ * Reads DATABASE_URL and nothing else. It never chooses a database. The
+ * connection itself is configured by server/src/db-config.ts, which is where the
+ * explicit TLS setting lives (Q18, amendment 2).
  *
  * Run it with `npm run migrate`, which supplies --env-file=.env. At step 7a the
  * server calls runMigrations() on boot, before Express accepts its first request.
@@ -21,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import pg from 'pg';
 import type { Client as PgClient } from 'pg';
+import { buildConnectionConfig, describeTarget, describeTls } from './db-config.ts';
 
 const { Client } = pg;
 
@@ -42,19 +45,6 @@ const CREATE_TRACKING_TABLE = `
     applied_at timestamptz NOT NULL DEFAULT now()
   );
 `;
-
-/**
- * Host and database name only, for the "target" line.
- * The connection string contains the password and must never be printed.
- */
-function describeTarget(connectionString: string): string {
-  try {
-    const url = new URL(connectionString);
-    return `${url.hostname}${url.pathname}`;
-  } catch {
-    return '(could not parse DATABASE_URL)';
-  }
-}
 
 /** The extra diagnostic fields node-postgres hangs off a database error. */
 interface PostgresErrorFields {
@@ -94,9 +84,12 @@ function count(n: number, noun: string): string {
 }
 
 export async function runMigrations(connectionString: string): Promise<void> {
-  const client = new Client({ connectionString });
+  // TLS comes from db-config.ts rather than from pg's reading of `sslmode` in the
+  // string. See that module for why the difference matters (Q18, amendment 2).
+  const client = new Client(buildConnectionConfig(connectionString));
 
   console.log(`migrate: target ${describeTarget(connectionString)}`);
+  console.log(`migrate: TLS ${describeTls(connectionString)}`);
 
   try {
     await client.connect();
