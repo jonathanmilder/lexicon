@@ -74,6 +74,7 @@ import path from 'node:path';
 import pg from 'pg';
 import type { Client as PgClient } from 'pg';
 import { buildConnectionConfig, describeTarget, describeTls } from '../src/db-config.ts';
+import { formatDatabaseError } from '../src/format-database-error.ts';
 
 const { Client } = pg;
 
@@ -1066,31 +1067,6 @@ interface WriteOutcome {
   /** lower(word) -> words.id. Step 9 resolves progress records through this. */
   readonly wordIds: ReadonlyMap<string, string>;
   readonly committed: boolean;
-}
-
-/**
- * The extra diagnostic fields node-postgres hangs off a database error.
- * migrate.ts has its own copy of this; at step 7a there will be a third caller
- * and it is worth extracting then. Two copies is not yet a module.
- */
-interface PostgresErrorFields {
-  code?: string;
-  detail?: string;
-  hint?: string;
-  constraint?: string;
-}
-
-function formatDatabaseError(error: unknown): string {
-  if (!(error instanceof Error)) return `  ${String(error)}`;
-
-  const fields = error as Error & PostgresErrorFields;
-  const lines = [`  ${error.message}`];
-
-  for (const key of ['code', 'detail', 'hint', 'constraint'] as const) {
-    const value = fields[key];
-    if (value) lines.push(`  ${key}: ${value}`);
-  }
-  return lines.join('\n');
 }
 
 /**

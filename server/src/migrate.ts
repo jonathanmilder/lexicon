@@ -24,6 +24,7 @@ import path from 'node:path';
 import pg from 'pg';
 import type { Client as PgClient } from 'pg';
 import { buildConnectionConfig, describeTarget, describeTls } from './db-config.ts';
+import { formatDatabaseError } from './format-database-error.ts';
 
 const { Client } = pg;
 
@@ -45,30 +46,6 @@ const CREATE_TRACKING_TABLE = `
     applied_at timestamptz NOT NULL DEFAULT now()
   );
 `;
-
-/** The extra diagnostic fields node-postgres hangs off a database error. */
-interface PostgresErrorFields {
-  code?: string;
-  detail?: string;
-  hint?: string;
-  position?: string;
-  where?: string;
-  constraint?: string;
-}
-
-/** The Postgres error verbatim, indented, one field per line. */
-function formatDatabaseError(error: unknown): string {
-  if (!(error instanceof Error)) return `  ${String(error)}`;
-
-  const fields = error as Error & PostgresErrorFields;
-  const lines = [`  ${error.message}`];
-
-  for (const key of ['code', 'detail', 'hint', 'position', 'where', 'constraint'] as const) {
-    const value = fields[key];
-    if (value) lines.push(`  ${key}: ${value}`);
-  }
-  return lines.join('\n');
-}
 
 async function rollbackQuietly(client: PgClient): Promise<void> {
   try {
