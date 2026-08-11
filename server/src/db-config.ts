@@ -140,14 +140,55 @@ export function buildConnectionConfig(connectionString: string): ClientConfig {
 }
 
 /**
- * Host and database name only, for the line every connecting program prints
- * before it acts. The connection string contains the password and must never be
- * printed in full.
+ * Shorten a Neon hostname to the part that proves which endpoint answered,
+ * without printing the whole address.
+ *
+ * Neon endpoint hostnames read `ep-<adjective>-<noun>-<id>.<region>.aws.neon.tech`.
+ * The two branches of this project have different adjectives, so the first two
+ * segments plus the region are enough to tell `dev` from `main` at a glance —
+ * which is the entire job of the line this appears in. The unique id and the
+ * constant `aws.neon.tech` tail do no work and come out.
+ *
+ * Anything that is not shaped like that — `localhost`, a bare IP, a short host —
+ * has nothing to abbreviate and is returned untouched.
+ */
+function abbreviateHost(hostname: string): string {
+  const labels = hostname.split('.');
+  const endpoint = labels[0];
+  const region = labels[1];
+  if (endpoint === undefined || region === undefined) return hostname;
+
+  const segments = endpoint.split('-');
+  if (segments.length <= 2) return hostname;
+
+  // ASCII '...' rather than a real ellipsis: Windows PowerShell 5.1 reads output
+  // through the legacy codepage and would render one as mojibake, and this line
+  // exists to be pasted into chat and into session logs.
+  return `${segments.slice(0, 2).join('-')}-...${region}`;
+}
+
+/**
+ * Database name and an abbreviated endpoint, for the line every connecting
+ * program prints before it acts.
+ *
+ * The connection string contains the password and must never be printed in full.
+ * The hostname is not a credential, but it is the project's address, and runs get
+ * pasted into chat and into Notion session logs — so it is abbreviated too. What
+ * survives is exactly what the line is FOR: proof that the intended target
+ * resolved, printed before anything happens.
+ *
+ * The BRANCH name is deliberately absent, because it is not in the connection
+ * string: Neon puts the branch in the endpoint id, not in a readable label, and
+ * both branches use the same database name. The loader knows its branch from
+ * `--target` and prints that itself on the line above. The server genuinely does
+ * not know — under Q18 it reads DATABASE_URL and never chooses a database —
+ * and printing a guess would be worse than printing nothing.
  */
 export function describeTarget(connectionString: string): string {
   try {
     const url = new URL(connectionString);
-    return `${url.hostname}${url.pathname}`;
+    const database = url.pathname.replace(/^\//, '') || '(no database in the string)';
+    return `${database} @ ${abbreviateHost(url.hostname)}`;
   } catch {
     return '(could not parse the connection string)';
   }
