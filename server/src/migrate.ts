@@ -146,13 +146,30 @@ export async function runMigrations(connectionString: string): Promise<void> {
   if (failedOn) process.exit(1);
 }
 
-const connectionString = process.env.DATABASE_URL;
+// ---------------------------------------------------------------------------
+// The command-line half
+// ---------------------------------------------------------------------------
+//
+// Everything above is a library. Everything below runs only when Node was told
+// to run THIS file — `npm run migrate`. `import.meta.main` is Node's own answer
+// to that question (added in v24.2; this project is on v24.14.1), and it is why
+// server/src/index.ts can import runMigrations for the boot hook without the
+// import itself reading the environment, connecting, and exiting the process.
+//
+// The alternative shapes, and why not: splitting the file in two would move the
+// runner off the path Q28 records, and comparing import.meta.url against
+// process.argv[1] by hand is the same test written less clearly and with a
+// Windows path-separator trap in it.
 
-if (!connectionString) {
-  console.error('migrate: DATABASE_URL is not set.');
-  console.error('  It belongs in .env — see .env.example for the shape.');
-  console.error('  `npm run migrate` passes --env-file=.env for you.');
-  process.exit(1);
+if (import.meta.main) {
+  const connectionString = process.env.DATABASE_URL;
+
+  if (!connectionString) {
+    console.error('migrate: DATABASE_URL is not set.');
+    console.error('  It belongs in .env — see .env.example for the shape.');
+    console.error('  `npm run migrate` passes --env-file=.env for you.');
+    process.exit(1);
+  }
+
+  await runMigrations(connectionString);
 }
-
-await runMigrations(connectionString);
