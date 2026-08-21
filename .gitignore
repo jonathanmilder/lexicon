@@ -8,3 +8,7 @@ dist/
 
 # Local planning documents — authoritative copy lives in Notion
 map.md
+handoff.md
+
+# Claude Code local tool permissions — machine-specific, not shared
+.claude/settings.local.json
